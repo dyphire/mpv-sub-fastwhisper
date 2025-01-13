@@ -12,11 +12,11 @@ local options = require "mp.options"
 
 ---- Script Options ----
 local o = {
-    -- Path to the whisper-faster executable, you can download it from here:
+    -- Path to the faster-whisper executable, you can download it from here:
     -- https://github.com/Purfview/whisper-standalone-win
     -- Supports absolute and relative paths
-    fast_whisper_path = "whisper-faster",
-    -- Model to use, available models are: base, small，medium, large, turbo
+    fast_whisper_path = "faster-whisper",
+    -- Model to use, available models are: base, small，medium, large, large-v2, large-v3, turbo
     model = "base",
     -- Device to use, available devices are: cpu, cuda
     device = "cpu",
@@ -26,6 +26,8 @@ local o = {
     -- Number of cpu threads to use
     -- Default value is 0 will auto-detect but max 4 threads
     threads = "0",
+    -- The maximum number of characters in a line before breaking the line
+    max_line_width = "100",
     -- Specify output path, supports absolute and relative paths
     -- Special value: "source" saves the subtitle file to the directory 
     -- where the video file is located
@@ -33,9 +35,17 @@ local o = {
     -- Specify how many subtitles are generated before updating
     -- to avoid frequent flickering of subtitles
     update_interval = 20,
+    -- Uses segmentation for speech transcription, 
+    -- which significantly improves the speed of subtitle initialization.
+    -- but it will reduce the accuracy and overall speed of subtitle generation, 
+    -- which is more suitable for long video scenarios.
+    --! Depends on FFmpeg
+    use_segment = false,
+    -- Segment duration in seconds
+    segment_duration = 10,
 }
 
-options.read_options(o)
+options.read_options(o, _, function() end)
 ------------------------
 
 local fast_whisper_path = mp.command_native({ "expand-path", o.fast_whisper_path })
@@ -92,12 +102,24 @@ local function format_time(time_str)
     return string.format("%02d:%02d:%02d,%03d", h, m, s, ms)
 end
 
-local function check_sub()
+local function timestamp_to_seconds(timestamp)
+    local h, m, s, ms = timestamp:match("(%d+):(%d+):(%d+),(%d+)")
+    return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) + tonumber(ms) / 1000
+end
+
+local function seconds_to_timestamp(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor(seconds / 60) % 60
+    local s = math.floor(seconds % 60)
+    local ms = math.floor((seconds - math.floor(seconds)) * 1000)
+    return string.format("%02d:%02d:%02d,%03d", h, m, s, ms)
+end
+
+local function check_sub(sub_file)
     local tracks = mp.get_property_native("track-list")
-    local fname = mp.get_property("filename/no-ext")
-    local sub_file = fname .. ".srt"
+    local _, sub_title = utils.split_path(sub_file)
     for _, track in ipairs(tracks) do
-        if track["type"] == "sub" and track["title"] == sub_file then
+        if track["type"] == "sub" and track["title"] == sub_title then
             return true, track["id"]
         end
     end
@@ -105,7 +127,7 @@ local function check_sub()
 end
 
 local function append_sub(sub_file)
-    local sub, id = check_sub()
+    local sub, id = check_sub(sub_file)
     if not sub then
         mp.commandv('sub-add', sub_file)
     else
@@ -135,8 +157,8 @@ local function fastwhisper()
     mp.osd_message("AI subtitle generation in progress", 9)
     msg.info("AI subtitle generation in progress")
     local file = io.open(subtitles_file, "w")
-    local command = string.format('%s "%s" --beep_off --model %s --device %s --output_dir %s',
-    fast_whisper_path, path, o.model, o.device, output_path)
+    local command = string.format('%s "%s" --beep_off --model %s --device %s --threads %s --max_line_width %s --output_dir %s',
+    fast_whisper_path, path, o.model, o.device, o.threads, o.max_line_width, output_path)
 
     if o.language ~= "" then
         command = command .. " --language " .. o.language
@@ -199,4 +221,212 @@ local function fastwhisper()
     end
 end
 
-mp.register_script_message("sub-fastwhisper", fastwhisper)
+
+------------------------
+local function extract_audio_segment(video_path, segment_audio_file, start_time, duration)
+    local arg = {
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-loglevel", "quiet",
+        "-i", video_path,
+        "-ss", tostring(start_time),
+        "-t", tostring(duration),
+        "-map", string.format("a:%s?", mp.get_property_number("current-tracks/audio/id", 0) - 1),
+        "-vn",
+        "-sn",
+        "-c:a", "copy",
+        segment_audio_file
+    }
+
+    local cmd = {
+        name = 'subprocess',
+        capture_stdout = true,
+        capture_stderr = true,
+        playback_only = true,
+        args = arg,
+    }
+
+    local res = mp.command_native(cmd)
+
+    if res and res.status ~= 0 then
+        msg.error("Error extracting audio segment: " .. segment_audio_file .. "\n" .. res.stderr)
+        return false
+    end
+    msg.verbose("Successfully extracted: " .. segment_audio_file)
+    return true
+end
+
+
+local function process_audio_segment(segment_audio_file, srt_file, subtitle_count, start_time)
+    local temp_srt_path = utils.split_path(segment_audio_file)
+    local temp_srt = segment_audio_file:gsub("%.wav$", ".srt")
+
+    local arg = {
+        fast_whisper_path,
+        segment_audio_file,
+        "--beep_off",
+        "--model", o.model,
+        "--device", o.device,
+        "--max_line_width", o.max_line_width,
+        "--threads", o.threads,
+        "--output_dir", temp_srt_path,
+    }
+
+    if o.language ~= "" then
+        table.insert(arg, "--language")
+        table.insert(arg, o.language)
+    end
+
+    local cmd = {
+        name = 'subprocess',
+        capture_stdout = true,
+        capture_stderr = true,
+        playback_only = true,
+        args = arg,
+    }
+
+    local res = mp.command_native(cmd)
+
+    if res and res.status ~= 0 then
+        msg.error("faster-whisper failed for: " .. segment_audio_file .. "\n" .. res.stderr)
+        return subtitle_count
+    end
+
+    if not file_exists(temp_srt) then
+        msg.error("Temporary SRT file not found: " .. temp_srt)
+        return subtitle_count
+    end
+
+    local temp_file = io.open(temp_srt, "r")
+    local main_file = io.open(srt_file, "a")
+
+    if not temp_file or not main_file then
+        msg.error("Failed to open temporary or main SRT file.")
+        return subtitle_count
+    end
+
+    local subtitle_number = subtitle_count
+    if subtitle_number == 1 then
+        mp.osd_message("AI subtitles are loaded and updated in real time", 5)
+        msg.info("AI subtitles are loaded and updated in real time")
+    end
+    for line in temp_file:lines() do
+        if line:match("%d+:%d+:%d+,%d+%D+%d+:%d+:%d+,%d+") then
+            local start_ts, end_ts = line:match("(%d+:%d+:%d+,%d+)%D+(%d+:%d+:%d+,%d+)")
+            if start_ts and end_ts then
+                local start_seconds = timestamp_to_seconds(start_ts) + start_time
+                local end_seconds = timestamp_to_seconds(end_ts) + start_time
+                main_file:write(subtitle_number .. "\n")
+                main_file:write(seconds_to_timestamp(start_seconds) .. " --> " .. seconds_to_timestamp(end_seconds) .. "\n")
+                subtitle_number = subtitle_number + 1
+            end
+        elseif line ~= "" and not tonumber(line) then
+            main_file:write(line .. "\n")
+        end
+    end
+
+    temp_file:close()
+    main_file:close()
+
+    os.remove(temp_srt)
+
+    return subtitle_number
+end
+
+local function process_video_incrementally(video_path, srt_file, segment_duration)
+    local start_time = 0
+    local subtitle_count = 1
+    local segment_index = 1
+    local temp_path = os.getenv("TEMP") or "/tmp/"
+
+    local file_duration = mp.get_property_number('duration')
+
+    while true do
+        if start_time >= file_duration then
+            break
+        end
+        if start_time + segment_duration > file_duration then
+            segment_duration = file_duration - start_time
+        end
+
+        local segment_audio_file = utils.join_path(temp_path, "temp.wav")
+        local temp_srt_file = utils.join_path(temp_path, "temp.srt")
+        if file_exists(segment_audio_file) then
+            os.remove(segment_audio_file)
+        end
+        if file_exists(temp_srt_file) then
+            os.remove(temp_srt_file)
+        end
+
+        local start_time_str = string.format("%02d:%02d:%02d", math.floor(start_time / 3600), math.floor(start_time / 60) % 60, start_time % 60)
+        msg.verbose(string.format("Extracting segment: %d, Start Time: %s", segment_index, start_time_str))
+
+        local success = extract_audio_segment(video_path, segment_audio_file, start_time_str, segment_duration)
+        if not success or not file_exists(segment_audio_file) then
+            msg.verbose("Audio extraction completed or failed.")
+            break
+        end
+
+        msg.verbose("Processing segment: " .. segment_audio_file)
+        subtitle_count = process_audio_segment(segment_audio_file, srt_file, subtitle_count, start_time)
+
+        append_sub(srt_file)
+
+        start_time = start_time + segment_duration
+        segment_index = segment_index + 1
+    end
+end
+
+local function fastwhisper_segment()
+    local path = mp.get_property("path")
+    local fname = mp.get_property("filename/no-ext")
+    if not path or is_protocol(path) then return end
+    if path then
+        path = normalize(path)
+        dir = utils.split_path(path)
+    end
+
+    if output_path ~= "source" then
+        subtitles_file = utils.join_path(output_path, fname .. ".fastwhisper.srt")
+    else
+        subtitles_file = utils.join_path(dir, fname .. ".fastwhisper.srt")
+    end
+
+    if file_exists(subtitles_file) then
+        msg.info("Subtitles file already exists: " .. subtitles_file)
+        return
+    end
+
+    mp.osd_message("AI subtitle generation in progress", 9)
+    msg.info("AI subtitle generation in progress")
+
+    process_video_incrementally(path, subtitles_file, o.segment_duration)
+
+    mp.osd_message("AI subtitles successfully generated", 5)
+    msg.info("Subtitles generation completed: " .. subtitles_file)
+end
+------------------------
+
+local function whisper()
+    if o.use_segment then
+        fastwhisper_segment()
+    else
+        fastwhisper()
+    end
+end
+
+mp.add_hook("on_unload", 50, function()
+    local temp_path = os.getenv("TEMP") or "/tmp/"
+    local segment_audio_file = utils.join_path(temp_path, "temp.wav")
+    local temp_srt_file = utils.join_path(temp_path, "temp.srt")
+    if file_exists(segment_audio_file) then
+        os.remove(segment_audio_file)
+    end
+    if file_exists(temp_srt_file) then
+        os.remove(temp_srt_file)
+    end
+end)
+
+mp.register_script_message("sub-fastwhisper", whisper)

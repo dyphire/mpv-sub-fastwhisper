@@ -3,9 +3,10 @@
 
 Generate srt subtitles through voice transcription using faster-whisper. 
 
-dependency:
+Dependency:
 
 - [faster-whisper](https://github.com/Purfview/whisper-standalone-win)
+- FFmpeg
 
 
 > [!NOTE]
