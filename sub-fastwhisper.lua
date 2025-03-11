@@ -161,15 +161,14 @@ end
 
 local function format_time(time_str)
     local h, m, s, ms = nil, nil, nil, nil
-    if time_str:match("%d+:%d+:%d+,%d+") then
-        return time_str
-    elseif time_str:match("%d+:%d+:%d+[%.:]%d+") then
+    if time_str:match("%d+:%d+:%d+[%.:]%d+") then
         h, m, s, ms = time_str:match("(%d+):(%d+):(%d+)[%.:](%d+)")
-    else
+    elseif time_str:match("%d+:%d+[%.:]%d+") then
+        h = 0
         m, s, ms = time_str:match("(%d+):(%d+)[%.:](%d+)")
+    else
+        return time_str
     end
-
-    if not h then h = 0 end
 
     return string.format("%02d:%02d:%02d,%03d", h, m, s, ms)
 end
